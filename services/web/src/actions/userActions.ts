@@ -81,18 +81,50 @@ export const unlockUserAction = ({ email, code, callback }: UnlockPayload) => {
     type: actionTypes.UNLOCK_USER,
     payload: { email, code, callback },
   };
-};
-
-export const unlockRedirectUserAction = ({
+({
   email,
   message,
   callback,
 }: UnlockRedirectPayload) => {
-  console.log("unlockRedirectUserAction", email, message, callback);
+  // Enhanced PII handling with dedicated logging framework
+  const logger = new PiiLogger('userActions');
+  
+  // Generate request ID for correlation without exposing PII
+  const requestId = generateRequestId();
+  
+  // Data minimization - hash the email instead of complete redaction
+  const userIdHash = hashUserIdentifier(email);
+  
+  // Implement proper log levels for different environments
+  logger.debug('User action details', {
+    requestId,
+    messageLength: message?.length || 0,
+    callbackType: typeof callback,
+    // Advanced sanitization for complex objects
+    messageContent: logger.sanitizeComplexObject(message)
+  });
+  
+  logger.info('unlockRedirectUserAction triggered', {
+    requestId,
+    userIdHash
+  });
+  
+  // Separate audit logging mechanism for security events
+  const auditLogger = new AuditLogger();
+  auditLogger.log({
+    action: 'user.unlock_redirect',
+    userIdHash,
+    requestId,
+    timestamp: new Date().toISOString(),
+    success: true
+  });
+  
   return {
     type: actionTypes.UNLOCK_USER_REDIRECT,
-    payload: { email, message, callback },
+    payload: { email, message, callback, requestId }, // Include requestId for correlation
   };
+}
+
 };
 
 export const signUpUserAction = ({
