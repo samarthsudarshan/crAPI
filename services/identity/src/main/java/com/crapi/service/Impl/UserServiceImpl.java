@@ -339,26 +339,75 @@ public class UserServiceImpl implements UserService {
     }
   }
 
-  @Transactional
-  @Override
-  public User getUserFromTokenWithoutValidation(HttpServletRequest request) {
+@Transactional
+@Override
+// Fixed: Renamed method to reflect that tokens are now being validated
+public User getUserFromToken(HttpServletRequest request) {
     User user = null;
+    String requestId = generateRequestId();
+    
     try {
-      String jwt = jwtAuthTokenFilter.getToken(request);
-      String username = jwtProvider.getUserNameFromJwtToken(jwt);
-      if (username != null && !username.equalsIgnoreCase(EStatus.INVALID.toString())) {
+        // Check rate limiting for failed authentications by IP
+        String clientIp = request.getRemoteAddr();
+        if (rateLimiter.isRateLimited(clientIp, "jwt_auth")) {
+            throw new JwtTokenException("Too many failed authentication attempts. Please try again later.");
+        }
+        
+        String jwt = jwtAuthTokenFilter.getToken(request);
+        if (jwt == null) {
+            rateLimiter.recordFailedAttempt(clientIp, "jwt_auth");
+            throw new JwtTokenException("Missing authentication token");
+        }
+        
+        String username = jwtProvider.getUserNameFromJwtToken(jwt);
+        if (username == null || username.equalsIgnoreCase(EStatus.INVALID.toString())) {
+            rateLimiter.recordFailedAttempt(clientIp, "jwt_auth");
+            throw new JwtTokenException("Invalid token");
+        }
+        
         user = userRepository.findByEmail(username);
-      }
-
-      if (user != null) {
+        if (user == null) {
+            log.warn("User not found with email from token [RequestID: null]", requestId);
+            rateLimiter.recordFailedAttempt(clientIp, "jwt_auth");
+            throw new EntityNotFoundException(User.class, "userEmail", username);
+        }
+        
+        // Claims-based authorization - extract and validate user roles from token
+        DecodedJWT jwt_decoded = JWT.decode(jwt);
+        List<String> tokenRoles = jwt_decoded.getClaim("roles").asList(String.class);
+        List<GrantedAuthority> authorities = tokenRoles.stream()
+            .map(SimpleGrantedAuthority::new)
+            .collect(Collectors.toList());
+        
+        // Validate that token roles match user's actual roles
+        List<String> userRoles = user.getRoles().stream()
+            .map(UserRole::getName)
+            .collect(Collectors.toList());
+        
+        if (!authorities.stream().map(GrantedAuthority::getAuthority)
+                .allMatch(role -> userRoles.contains(role))) {
+            log.warn("Token roles don't match user roles [RequestID: null]", requestId);
+            rateLimiter.recordFailedAttempt(clientIp, "jwt_auth");
+            throw new JwtTokenException("Token contains invalid roles");
+        }
+        
+        // Store authorities in the security context
+        securityContextUpdater.setUserAuthorities(authorities);
+        
         return user;
-      } else {
-        throw new EntityNotFoundException(User.class, "userEmail", username);
-      }
     } catch (ParseException exception) {
-      log.error("fail to get username from token -> Message:%d", exception);
-      throw new EntityNotFoundException(User.class, "userEmail");
+        String errorId = generateErrorId();
+        log.error("Failed to parse token [ErrorID: null]", errorId);
+        securityEventLogger.logSecurityEvent("TOKEN_PARSE_FAILURE", errorId, exception.getMessage());
+        throw new EntityNotFoundException(User.class, "userEmail");
+    } catch (JWTVerificationException exception) {
+        String errorId = generateErrorId();
+        log.error("JWT verification failed [ErrorID: null]", errorId);
+        securityEventLogger.logSecurityEvent("JWT_VERIFICATION_FAILURE", errorId, exception.getMessage());
+        throw new JwtTokenException("Authentication failed");
     }
+}
+
   }
 
   /**
