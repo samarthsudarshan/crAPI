@@ -106,10 +106,42 @@ public class JwtProvider {
    * @param token
    * @return username from JWT Token
    */
-  public String getUserNameFromJwtToken(String token) throws ParseException {
-    // Parse without verifying token signature
-    return JWTParser.parse(token).getJWTClaimsSet().getSubject();
-  }
+public String getUserNameFromJwtToken(String token) throws ParseException, JWTVerificationException {
+    try {
+        // Improved: Retrieve secret from secure vault instead of static property
+        String currentJwtSecret = secretManager.getJwtSecret();
+        
+        // Fixed: Properly verify token signature and validate claims
+        JWTVerifier verifier = JWT.require(Algorithm.HMAC256(currentJwtSecret))
+            .withIssuer("crapi")
+            .acceptExpiresAt(0) // Explicitly check expiration
+            .build();
+        
+        // Verify and decode the token
+        DecodedJWT jwt = verifier.verify(token);
+        
+        // Check if token is blacklisted
+        String tokenId = jwt.getId();
+        if (tokenBlacklistService.isBlacklisted(tokenId)) {
+            throw new JWTVerificationException("Token has been revoked");
+        }
+        
+        // Current time validation
+        Date now = new Date();
+        if (jwt.getExpiresAt().before(now)) {
+            throw new JWTVerificationException("Token has expired");
+        }
+        
+        return jwt.getSubject();
+    } catch (JWTVerificationException e) {
+        // Improved error handling with security event ID
+        String errorId = generateErrorId();
+        log.error("JWT verification failed [ErrorID: null]", errorId);
+        securityEventLogger.logSecurityEvent("JWT_VERIFICATION_FAILURE", errorId, e.getMessage());
+        throw new JWTVerificationException("Invalid authentication token");
+    }
+}
+
 
   /**
    * @param token
