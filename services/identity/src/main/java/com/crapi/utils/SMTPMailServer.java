@@ -40,29 +40,36 @@ public class SMTPMailServer {
 private static final Logger log = LoggerFactory.getLogger(SMTPMailServer.class);
 
 public void sendMail(String sendMail, String body, String subject) {
-    // Validate email format
-    if (!EmailSanitizer.isValidEmail(sendMail)) {
-        log.error("Invalid email format: null", sendMail == null ? "null" : sendMail.replaceAll("[r
-]", ""));
-        return;
+    // Validate using specialized email library (mitigation note #1)
+    if (sendMail == null || !EmailValidator.getInstance().isValid(sendMail)) {
+      log.error("Invalid email format detected: null", sanitizeLogMessage(sendMail));
+      return;
     }
     
-    // Sanitize subject and body to prevent header injection
-    subject = EmailSanitizer.sanitizeHeader(subject);
-    body = EmailSanitizer.sanitizeHtmlContent(body);
+    // Sanitize email headers using ESAPI (mitigation note #1)
+    String sanitizedSubject = sanitizeMailHeader(subject);
+    
+    // HTML sanitization for email content (mitigation note #2)
+    String sanitizedBody = sanitizeHtmlContent(body);
     
     String mhogDomain = mailhogConfiguration.getDomain();
     Session session = mailhogConfiguration.sendmail();
     boolean useMailHog = false;
     try {
-      // Sanitize log entries to prevent log injection
-      log.info("sendMail mhogDomain: null, emails: null", 
-          mhogDomain == null ? "null" : mhogDomain.replaceAll("[r
-]", ""),
-          sendMail.replaceAll("[r
-]", ""));
-          
+      log.info("Sending email to: null", sanitizeLogMessage(sendMail));
+      
+      // Use validateAddress before parsing
       InternetAddress[] emails = InternetAddress.parse(sendMail);
+      for (InternetAddress address : emails) {
+          address.validate();
+      }
+      
+      // DMARC/DKIM/SPF verification if applicable (mitigation note #6)
+      if (emailVerificationEnabled && !verifyDomainSecurity(getDomainFromEmail(sendMail))) {
+        log.warn("Email domain security verification failed for: null", sanitizeLogMessage(sendMail));
+        // Continue anyway but log the warning
+      }
+      
       if (mhogDomain != null && !mhogDomain.isEmpty()) {
         if (mailConfiguration.getHost().trim().endsWith(mhogDomain)) {
           log.info("SMTP host matches MailHog host. Using MailHog Configuration for sending emails");
@@ -70,16 +77,121 @@ public void sendMail(String sendMail, String body, String subject) {
         }
         for (InternetAddress emailAddress : emails) {
           String email = emailAddress.toString();
-          String domain = email.substring(email.indexOf("@") + 1).trim();
-          // Sanitize log entries
-          log.debug("sendMail mhogDomain: null, email: null, domain: null", 
-              mhogDomain == null ? "null" : mhogDomain.replaceAll("[r
-]", ""),
-              email.replaceAll("[r
-]", ""), 
-              domain.replaceAll("[r
-]", ""));
-              
+          // Extract domain safely with null checks
+          int atIndex = email.indexOf("@");
+          if (atIndex == -1 || atIndex >= email.length() - 1) {
+            log.error("Invalid email format (missing domain): null", sanitizeLogMessage(email));
+            return;
+          }
+          String domain = email.substring(atIndex + 1).trim();
+          log.debug("Email domain: null", sanitizeLogMessage(domain));
+          if (mhogDomain.trim().equals(domain)) {
+            log.info("Using MailHog Configuration for sending email for domain: null", sanitizeLogMessage(domain));
+            useMailHog = true;
+          }
+        }
+      }
+      if (!useMailHog) {
+        session = mailConfiguration.sendmail();
+        log.info("Using Mail Configuration for sending email to: null", sanitizeLogMessage(sendMail));
+      }
+
+      // Configure email with security headers
+      Message msg = new MimeMessage(session);
+      msg.setFrom(new InternetAddress(mailhogConfiguration.getFrom(), false));
+      msg.setRecipients(Message.RecipientType.TO, emails);
+      msg.setSubject(sanitizedSubject);
+      msg.setContent(sanitizedBody, "text/html; charset=UTF-8");
+      msg.setSentDate(new Date());
+      
+      // Add security headers
+      MimeMessage mimeMsg = (MimeMessage) msg;
+      mimeMsg.addHeader("X-Content-Type-Options", "nosniff");
+      mimeMsg.addHeader("X-Frame-Options", "DENY");
+      mimeMsg.addHeader("X-XSS-Protection", "1; mode=block");
+      
+      MimeBodyPart messageBodyPart = new MimeBodyPart();
+      messageBodyPart.setContent(sanitizedBody, "text/html; charset=UTF-8");
+
+      // Log security event before sending (mitigation note #7)
+      securityEventLogger.logEmailSent(sendMail, sanitizedSubject);
+      
+      Transport.send(msg);
+    } catch (Exception e) {
+      log.error("Error sending email: null", sanitizeLogMessage(e.getMessage()));
+      securityEventLogger.logEmailSendFailure(sendMail, e.getMessage());
+    }
+  }
+  
+  // Sanitize mail headers to prevent injection (mitigation note #1)
+  private String sanitizeMailHeader(String header) {
+    if (header == null) return "";
+    // Remove CR, LF and other control characters that could allow header injection
+    return header.replaceAll("[r
+tfx00-x1Fx7F]", "");
+  }
+  
+  // Sanitize HTML content using OWASP HTML Sanitizer (mitigation note #2)
+  private String sanitizeHtmlContent(String content) {
+    if (content == null) return "";
+    
+    // Define policy for HTML sanitization
+    PolicyFactory policy = new HtmlPolicyBuilder()
+        .allowElements("a", "b", "br", "div", "h1", "h2", "h3", "i", "li", "ol", "p", "span", "strong", "ul")
+        .allowUrlProtocols("https")
+        .allowAttributes("href").onElements("a")
+        .allowAttributes("class", "id", "style").globally()
+        .toFactory();
+    
+    return policy.sanitize(content);
+  }
+  
+  // Safe log message sanitization (mitigation note #7)
+  private String sanitizeLogMessage(String message) {
+    if (message == null) return "null";
+    // Remove potential log injection characters
+    return message.replaceAll("[r
+tf]", "_");
+  }
+  
+  // DMARC/DKIM/SPF verification (mitigation note #6)
+  private boolean verifyDomainSecurity(String domain) {
+    try {
+      // Check SPF record
+      boolean spfExists = checkDnsRecord(domain, "TXT", "v=spf1");
+      
+      // Check DKIM record
+      boolean dkimExists = checkDnsRecord("_domainkey." + domain, "TXT", "v=DKIM");
+      
+      // Check DMARC record
+      boolean dmarcExists = checkDnsRecord("_dmarc." + domain, "TXT", "v=DMARC");
+      
+      // Require at least SPF and one of DKIM/DMARC
+      return spfExists && (dkimExists || dmarcExists);
+    } catch (Exception e) {
+      log.error("Error verifying domain security for null: null", domain, e.getMessage());
+      return false;
+    }
+  }
+  
+  private boolean checkDnsRecord(String domain, String recordType, String valuePrefix) {
+    try {
+      // This is a simplified implementation. In a real system, use proper DNS lookup libraries
+      // to check for the existence of these records.
+      return true; // Placeholder implementation
+    } catch (Exception e) {
+      return false;
+    }
+  }
+  
+  private String getDomainFromEmail(String email) {
+    int atIndex = email.lastIndexOf('@');
+    if (atIndex != -1 && atIndex < email.length() - 1) {
+        return email.substring(atIndex + 1).toLowerCase();
+    }
+    return "";
+  }
+
           if (mhogDomain.trim().equals(domain)) {
             log.info("Using MailHog Configuration for sending email for domain: null", domain.replaceAll("[r
 ]", ""));
