@@ -108,32 +108,17 @@ public class MailBody {
    * @param changePhoneRequest
    * @return Mail Body, for Change Phone number.
    */
-  public static String changeMailBody(ChangePhoneForm changePhoneRequest) {
-    String msgBody =
-        "<html><body>"
-            + "<font face='calibri' style = 'font-size:15px; color:#000;'>Hi"
-            + "<font>,"
-            + "<p><font face='calibri' style = 'font-size:15px;color:#000;'>We received a request to change your account phone Number. The previous number is: </font><font face='calibri' font color='#0000ff'><b>"
-            + changePhoneRequest.getOld_number()
-            + "</b></font>"
-            + "<font face='calibri' style = 'font-size:15px;color:#000;'> and the new one is: <b>"
-            + changePhoneRequest.getNew_number()
-            + "</b></font></p>"
-            + "<font face='calibri' style = 'font-size:15px;color:#000;'>To complete the process, please use the following otp: <b>"
-            + changePhoneRequest.getOtp()
-            + "</b>"
-            + "<br>"
-            + "<br>"
-            + "<p><font face='calibri' style = 'font-size:15px;color:#000;'>If you haven not sent a request to change your phone number, please ignore this message.</font></p>"
-            + "<p><font face='calibri' style = 'font-size:15px;color:#000;'>Thank You & have a wonderful day !</font></p>"
-            + "<font face='calibri' style = 'font-size:15px;color:#000;'>Warm Regards,<br/><b>crAPI - Team</b></font><font face='calibri' font color='#0000ff'></font><br/>"
-            + "<strong>Email:</strong>&nbsp;<a href='mailto:support@crapi.io'>support@crapi.io</a></font><br><font face='calibri'>&nbsp;&nbsp;<br> "
-            + "<em style= 'color:#000;'>This E-mail and any attachments are private, intended solely for the use of the addressee. If you are not the intended recipient, they have been sent to you in error: any use of information in them is strictly prohibited. </em>"
-            + "</body>"
-            + "</html>";
-
-    return msgBody;
+public static String changeMailBody(ChangePhoneForm changePhoneRequest) {
+    // Sanitize user inputs to prevent mail injection
+    // Using HTML escaping for content that goes into the HTML body
+    String oldNumber = StringEscapeUtils.escapeHtml4(changePhoneRequest.getOld_number());
+    String newNumber = StringEscapeUtils.escapeHtml4(changePhoneRequest.getNew_number());
+    String otp = StringEscapeUtils.escapeHtml4(changePhoneRequest.getOtp());
+    
+    // Build email using template pattern to separate content from presentation
+    return EmailTemplateService.getPhoneChangeTemplate(oldNumber, newNumber, otp);
   }
+
 
   /**
    * @param code
