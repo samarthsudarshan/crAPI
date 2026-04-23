@@ -239,13 +239,24 @@ public class UserServiceImpl implements UserService {
    *     new email address.
    * @return send email to new email with random generated token.
    */
-  @Transactional
+@Transactional
   @Override
   public CRAPIResponse changeEmailRequest(
       HttpServletRequest request, ChangeEmailForm changeEmailForm) {
     String token;
     User user;
     ChangeEmailRequest changeEmailRequest;
+    
+    // Enhanced email validation as suggested in mitigation notes
+    if (!isValidEmail(changeEmailForm.getNew_email()) || !isValidEmail(changeEmailForm.getOld_email())) {
+      return new CRAPIResponse("Invalid email format", 400);
+    }
+    
+    // Check if the domain is in our allowlist
+    if (!isAllowlistedDomain(changeEmailForm.getNew_email())) {
+      return new CRAPIResponse("Email domain not allowed", 400);
+    }
+    
     // Checking new email in user login table if it is already registered then not allowing that
     // email
     if (userRepository.existsByEmail(changeEmailForm.getNew_email())) {
@@ -257,8 +268,17 @@ public class UserServiceImpl implements UserService {
       return new CRAPIResponse(
           UserMessage.EMAIL_NOT_REGISTERED + changeEmailForm.getOld_email(), 404);
     }
-    token = EmailTokenGenerator.generateRandom(10);
+    
+    // Get user from token
     user = getUserFromToken(request);
+    
+    // Implement rate limiting as suggested in mitigation notes
+    if (!checkRateLimit(user)) {
+      return new CRAPIResponse("Too many email change requests. Please try again later.", 429);
+    }
+    
+    token = EmailTokenGenerator.generateRandom(10);
+    
     // fetching ChangeEmail Data for user
     changeEmailRequest = changeEmailRepository.findByUser(user);
     if (changeEmailRequest == null) {
@@ -274,13 +294,135 @@ public class UserServiceImpl implements UserService {
     }
     changeEmailForm.setToken(token);
     changeEmailRepository.save(changeEmailRequest);
+    
+    // Use email template system instead of dynamic construction
+    Map<String, String> templateParams = new HashMap<>();
+    templateParams.put("token", token);
+    templateParams.put("username", user.getName());
+    templateParams.put("newEmail", changeEmailForm.getNew_email());
+    
+    String emailBody = getEmailFromTemplate("change_email_template", templateParams);
+    
+    // Use structured email handling via Jakarta Mail APIs
     smtpMailServer.sendMail(
-        changeEmailForm.getNew_email(),
-        MailBody.changeMailBody(changeEmailForm),
+        canonicalizeEmail(changeEmailForm.getNew_email()),
+        emailBody,
         "crAPI: Change Email Token");
+        
     return new CRAPIResponse(
         UserMessage.CHANGE_EMAIL_MESSAGE + changeEmailForm.getNew_email(), 200);
   }
+  
+  /**
+   * Comprehensive email validation as per mitigation notes
+   */
+  private boolean isValidEmail(String email) {
+      if (email == null) return false;
+      
+      // Canonicalize before validation
+      email = canonicalizeEmail(email);
+      
+      // First check for special characters used in header injections
+      if (email.matches(".*[r
+tfv,;:].*")) return false;
+      
+      // Then perform standard email validation with strict rules
+      return EmailValidator.getInstance(true, true).isValid(email);
+  }
+  
+  /**
+   * Canonicalize email to handle various input formats
+   */
+  private String canonicalizeEmail(String email) {
+      if (email == null) return "";
+      
+      // Normalize to consistent form
+      email = Normalizer.normalize(email, Normalizer.Form.NFKC);
+      
+      // Additional sanitization
+      email = email.trim().toLowerCase();
+      
+      return email;
+  }
+  
+  /**
+   * Domain allowlisting implementation as per mitigation notes
+   */
+  private boolean isAllowlistedDomain(String email) {
+      if (email == null || !email.contains("@")) return false;
+      
+      String[] allowedDomains = {"example.com", "crapi.com", "trusted-domain.com", "company.org"};
+      String domain = email.substring(email.lastIndexOf("@") + 1).toLowerCase();
+      
+      return Arrays.asList(allowedDomains).contains(domain);
+  }
+  
+  // Cache for rate limiting
+  private static final Cache<String, Integer> emailRequestsCache = CacheBuilder.newBuilder()
+      .expireAfterWrite(1, TimeUnit.HOURS)
+      .build();
+      
+  private static final int MAX_EMAILS_PER_HOUR = 5;
+  
+  /**
+   * Rate limiting implementation as per mitigation notes
+   */
+  private boolean checkRateLimit(User user) {
+      if (user == null) return false;
+      
+      String cacheKey = "email_change_" + user.getId();
+      Integer requestCount = emailRequestsCache.getIfPresent(cacheKey);
+      
+      if (requestCount == null) {
+          emailRequestsCache.put(cacheKey, 1);
+          return true;
+      } else if (requestCount < MAX_EMAILS_PER_HOUR) {
+          emailRequestsCache.put(cacheKey, requestCount + 1);
+          return true;
+      }
+      
+      return false;
+  }
+  
+  /**
+   * Email template system implementation as per mitigation notes
+   */
+  private String getEmailFromTemplate(String templateName, Map<String, String> params) {
+      // In a real implementation, this would load a template file
+      String template = loadTemplate(templateName);
+      
+      // Replace parameters in template with sanitized values
+      for (Map.Entry<String, String> param : params.entrySet()) {
+          template = template.replace("{{" + param.getKey() + "}}", sanitize(param.getValue()));
+      }
+      
+      return template;
+  }
+  
+  /**
+   * Load email template - this is a stub implementation
+   */
+  private String loadTemplate(String templateName) {
+      // In a real implementation, this would load from file system or database
+      if ("change_email_template".equals(templateName)) {
+          return "<html><body><h1>Email Change Request</h1>"
+              + "<p>Hello {{username}},</p>"
+              + "<p>Your token for changing email to {{newEmail}} is: {{token}}</p>"
+              + "<p>Thank you for using crAPI!</p></body></html>";
+      }
+      return "<html><body><p>Generic Email Template</p></body></html>";
+  }
+  
+  /**
+   * Sanitize parameter values for email templates
+   */
+  private String sanitize(String value) {
+      if (value == null) return "";
+      
+      // Remove potential HTML/script injection
+      return value.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  }
+
 
   /**
    * @param request getting jwt token for user from request header
