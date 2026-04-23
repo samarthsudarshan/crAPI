@@ -239,48 +239,193 @@ public class UserServiceImpl implements UserService {
    *     new email address.
    * @return send email to new email with random generated token.
    */
-  @Transactional
+@Transactional
   @Override
   public CRAPIResponse changeEmailRequest(
       HttpServletRequest request, ChangeEmailForm changeEmailForm) {
     String token;
     User user;
     ChangeEmailRequest changeEmailRequest;
-    // Checking new email in user login table if it is already registered then not allowing that
-    // email
-    if (userRepository.existsByEmail(changeEmailForm.getNew_email())) {
+    
+    // Retrieve user from token
+    user = getUserFromToken(request);
+    
+    // Check if user has exceeded rate limit for email change requests
+    // Added rate limiting implementation as per mitigation note #3
+    if (isRateLimitExceeded(user.getId())) {
+        log.warn("Rate limit exceeded for user ID: null", user.getId());
+        return new CRAPIResponse("Too many email change requests. Please try again later.", 429);
+    }
+    
+    // Validate email format using Apache Commons Validator instead of custom regex (mitigation note #1)
+    if (!EmailValidator.getInstance().isValid(changeEmailForm.getNew_email()) || 
+        !EmailValidator.getInstance().isValid(changeEmailForm.getOld_email())) {
+      return new CRAPIResponse("Invalid email format provided", 400);
+    }
+    
+    String newEmail = changeEmailForm.getNew_email();
+    String oldEmail = changeEmailForm.getOld_email();
+    
+    // Domain validation - check against allowlist/blocklist (mitigation note #4)
+    if (!isDomainAllowed(getDomainFromEmail(newEmail)) || !isDomainAllowed(getDomainFromEmail(oldEmail))) {
+        return new CRAPIResponse("Email domain not allowed", 400);
+    }
+    
+    // Verify MX records exist for email domains (mitigation note #8)
+    if (!hasMxRecord(getDomainFromEmail(newEmail)) || !hasMxRecord(getDomainFromEmail(oldEmail))) {
+        return new CRAPIResponse("Email domain does not have valid mail servers", 400);
+    }
+    
+    // Checking new email in user login table if it is already registered then not allowing that email
+    if (userRepository.existsByEmail(newEmail)) {
       return new CRAPIResponse(
-          UserMessage.EMAIL_ALREADY_REGISTERED + changeEmailForm.getNew_email(), 403);
+          UserMessage.EMAIL_ALREADY_REGISTERED + newEmail, 403);
     }
     // Checking old email either it's registered or not.
-    if (!userRepository.existsByEmail(changeEmailForm.getOld_email())) {
+    if (!userRepository.existsByEmail(oldEmail)) {
       return new CRAPIResponse(
-          UserMessage.EMAIL_NOT_REGISTERED + changeEmailForm.getOld_email(), 404);
+          UserMessage.EMAIL_NOT_REGISTERED + oldEmail, 404);
     }
+    
     token = EmailTokenGenerator.generateRandom(10);
-    user = getUserFromToken(request);
+    
     // fetching ChangeEmail Data for user
     changeEmailRequest = changeEmailRepository.findByUser(user);
     if (changeEmailRequest == null) {
       // Creating new object if changeEmail data for user is not in database
-      changeEmailRequest =
-          new ChangeEmailRequest(
-              changeEmailForm.getNew_email(), changeEmailForm.getOld_email(), token, user);
+      changeEmailRequest = new ChangeEmailRequest(newEmail, oldEmail, token, user);
     } else {
       // updating the existing changeEmail data for user
       changeEmailRequest.setEmailToken(token);
-      changeEmailRequest.setNewEmail(changeEmailForm.getNew_email());
-      changeEmailRequest.setOldEmail(changeEmailForm.getOld_email());
+      changeEmailRequest.setNewEmail(newEmail);
+      changeEmailRequest.setOldEmail(oldEmail);
     }
+    
     changeEmailForm.setToken(token);
     changeEmailRepository.save(changeEmailRequest);
+    
+    // Use template engine for email content (mitigation note #5)
+    String emailContent = generateEmailTemplate(changeEmailForm);
+    
+    // Send verification emails to both old and new addresses (mitigation note #9)
     smtpMailServer.sendMail(
-        changeEmailForm.getNew_email(),
-        MailBody.changeMailBody(changeEmailForm),
+        newEmail,
+        emailContent,
         "crAPI: Change Email Token");
+        
+    // Send notification to old email as part of multi-factor verification (mitigation note #9)
+    smtpMailServer.sendMail(
+        oldEmail,
+        generateOldEmailNotification(changeEmailForm),
+        "crAPI: Email Change Notification");
+        
+    // Log security event (mitigation note #7)
+    securityEventLogger.logEmailChangeRequest(user.getId(), oldEmail, newEmail);
+    
+    // Record this request in rate limiter
+    recordEmailChangeRequest(user.getId());
+    
     return new CRAPIResponse(
-        UserMessage.CHANGE_EMAIL_MESSAGE + changeEmailForm.getNew_email(), 200);
+        UserMessage.CHANGE_EMAIL_MESSAGE + newEmail, 200);
   }
+  
+  // Domain allowlist/blocklist check implementation (mitigation note #4)
+  private boolean isDomainAllowed(String domain) {
+    // Check against blocked domains
+    if (blockedDomainRepository.isBlocked(domain)) {
+        return false;
+    }
+    
+    // If we have an allowlist enabled, check if domain is in allowlist
+    if (configService.isAllowlistEnabled()) {
+        return allowedDomainRepository.isAllowed(domain);
+    }
+    
+    // If no allowlist is enabled, domain is allowed as long as it's not blocked
+    return true;
+  }
+  
+  private String getDomainFromEmail(String email) {
+    int atIndex = email.lastIndexOf('@');
+    if (atIndex != -1 && atIndex < email.length() - 1) {
+        return email.substring(atIndex + 1).toLowerCase();
+    }
+    return "";
+  }
+  
+  // MX record validation implementation (mitigation note #8)
+  @Cacheable(value = "mxRecordCache", key = "#domain")
+  private boolean hasMxRecord(String domain) {
+    try {
+        Record[] records = new Lookup(domain, Type.MX).run();
+        return records != null && records.length > 0;
+    } catch (TextParseException e) {
+        log.error("Error validating MX record for domain: null", domain, e);
+        return false;
+    }
+  }
+  
+  // Clear MX record cache periodically
+  @Scheduled(fixedRate = 3600000) // Every hour
+  @CacheEvict(value = "mxRecordCache", allEntries = true)
+  public void clearMxRecordCache() {
+    log.info("Clearing MX record cache");
+  }
+  
+  // Use template engine for email content (mitigation note #5)
+  private String generateEmailTemplate(ChangeEmailForm changeEmailForm) {
+    Context context = new Context();
+    context.setVariable("token", changeEmailForm.getToken());
+    context.setVariable("newEmail", changeEmailForm.getNew_email());
+    context.setVariable("oldEmail", changeEmailForm.getOld_email());
+    
+    // Use Thymeleaf template engine to safely render email content
+    return templateEngine.process("email-change-template", context);
+  }
+  
+  private String generateOldEmailNotification(ChangeEmailForm changeEmailForm) {
+    Context context = new Context();
+    context.setVariable("newEmail", changeEmailForm.getNew_email());
+    context.setVariable("token", changeEmailForm.getToken());
+    
+    // Use Thymeleaf template engine to safely render email content
+    return templateEngine.process("email-change-notification", context);
+  }
+  
+  // Rate limiting implementation (mitigation note #3)
+  private static final Map<Long, RequestCount> requestCounts = new ConcurrentHashMap<>();
+  private static final int MAX_REQUESTS = 5;
+  private static final long WINDOW_SIZE_MS = TimeUnit.MINUTES.toMillis(15);
+  
+  private static class RequestCount {
+    private int count = 0;
+    private long windowStart = System.currentTimeMillis();
+    
+    public synchronized boolean incrementAndCheck() {
+        long now = System.currentTimeMillis();
+        if (now - windowStart > WINDOW_SIZE_MS) {
+            // Reset window if it has expired
+            count = 1;
+            windowStart = now;
+            return false;
+        } else if (count < MAX_REQUESTS) {
+            // Increment within window
+            count++;
+            return false;
+        }
+        return true; // Limit exceeded
+    }
+  }
+  
+  private boolean isRateLimitExceeded(Long userId) {
+    RequestCount rc = requestCounts.computeIfAbsent(userId, k -> new RequestCount());
+    return rc.incrementAndCheck();
+  }
+  
+  private void recordEmailChangeRequest(Long userId) {
+    requestCounts.computeIfAbsent(userId, k -> new RequestCount());
+  }
+
 
   /**
    * @param request getting jwt token for user from request header
