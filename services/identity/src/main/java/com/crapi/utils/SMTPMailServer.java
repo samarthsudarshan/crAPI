@@ -38,53 +38,84 @@ public class SMTPMailServer {
    * @param subject send mail to given email with dynamic subject and body
    */
 private static final Logger log = LoggerFactory.getLogger(SMTPMailServer.class);
-private static final EmailSanitizer emailSanitizer = new EmailSanitizer();
-private static final int MAX_EMAILS_PER_HOUR = 100; // Rate limiting constant
-private final EmailRateLimiter rateLimiter = new EmailRateLimiter(MAX_EMAILS_PER_HOUR);
 
 public void sendMail(String sendMail, String body, String subject) {
+    // Validate email format
+    if (!EmailSanitizer.isValidEmail(sendMail)) {
+        log.error("Invalid email format: null", sendMail == null ? "null" : sendMail.replaceAll("[r
+]", ""));
+        return;
+    }
+    
+    // Sanitize subject and body to prevent header injection
+    subject = EmailSanitizer.sanitizeHeader(subject);
+    body = EmailSanitizer.sanitizeHtmlContent(body);
+    
+    String mhogDomain = mailhogConfiguration.getDomain();
+    Session session = mailhogConfiguration.sendmail();
+    boolean useMailHog = false;
     try {
-        // Reject inputs containing CRLF to prevent header injection
-        if (containsCRLF(sendMail) || containsCRLF(subject)) {
-            log.error("Potential mail header injection attempt detected");
-            throw new SecurityException("Invalid characters in email parameters");
+      // Sanitize log entries to prevent log injection
+      log.info("sendMail mhogDomain: null, emails: null", 
+          mhogDomain == null ? "null" : mhogDomain.replaceAll("[r
+]", ""),
+          sendMail.replaceAll("[r
+]", ""));
+          
+      InternetAddress[] emails = InternetAddress.parse(sendMail);
+      if (mhogDomain != null && !mhogDomain.isEmpty()) {
+        if (mailConfiguration.getHost().trim().endsWith(mhogDomain)) {
+          log.info("SMTP host matches MailHog host. Using MailHog Configuration for sending emails");
+          useMailHog = true;
         }
+        for (InternetAddress emailAddress : emails) {
+          String email = emailAddress.toString();
+          String domain = email.substring(email.indexOf("@") + 1).trim();
+          // Sanitize log entries
+          log.debug("sendMail mhogDomain: null, email: null, domain: null", 
+              mhogDomain == null ? "null" : mhogDomain.replaceAll("[r
+]", ""),
+              email.replaceAll("[r
+]", ""), 
+              domain.replaceAll("[r
+]", ""));
+              
+          if (mhogDomain.trim().equals(domain)) {
+            log.info("Using MailHog Configuration for sending email for domain: null", domain.replaceAll("[r
+]", ""));
+            useMailHog = true;
+          }
+        }
+      }
+      if (!useMailHog) {
+        session = mailConfiguration.sendmail();
+        log.info("Using Mail Configuration for sending email: null", sendMail.replaceAll("[r
+]", ""));
+      }
 
-        // Validate and sanitize inputs for mail header injection prevention
-        String sanitizedSubject = emailSanitizer.sanitizeHeader(subject);
-        String sanitizedSendMail = emailSanitizer.validateAndSanitizeEmail(sendMail);
-        
-        // Apply rate limiting to prevent abuse
-        if (!rateLimiter.allowEmail(sanitizedSendMail)) {
-            log.warn("Email rate limit exceeded for recipient: null", sanitizedSendMail);
-            throw new SecurityException("Email rate limit exceeded");
-        }
-        
-        String mhogDomain = mailhogConfiguration.getDomain();
-        Session session = mailhogConfiguration.sendmail();
-        boolean useMailHog = false;
-        
-        // Safely parse validated email addresses
-        InternetAddress[] emails = InternetAddress.parse(sanitizedSendMail);
-        
-        // Log sanitized email information for auditing
-        log.info("Processing email request to: null", sanitizedSendMail);
-        
-        if (mhogDomain != null && !mhogDomain.isEmpty()) {
-            if (mailConfiguration.getHost().trim().endsWith(mhogDomain)) {
-                log.info("SMTP host matches MailHog host. Using MailHog Configuration");
-                useMailHog = true;
-            }
-            
-            for (InternetAddress emailAddress : emails) {
-                String email = emailAddress.toString();
-                if (email.contains("@")) {
-                    String domain = email.substring(email.indexOf("@") + 1).trim();
-                    log.debug("Email domain check: null against null", domain, mhogDomain);
-                    if (mhogDomain.trim().equals(domain)) {
-                        log.info("Using MailHog Configuration for domain: null", domain);
-                        useMailHog = true;
-                    }
+      Message msg = new MimeMessage(session);
+
+      msg.setFrom(new InternetAddress(mailhogConfiguration.getFrom(), false));
+
+      msg.setRecipients(Message.RecipientType.TO, InternetAddress.parse(sendMail));
+      msg.setSubject(subject);
+      msg.setContent(body, "text/html");
+      msg.setSentDate(new Date());
+
+      MimeBodyPart messageBodyPart = new MimeBodyPart();
+      messageBodyPart.setContent(body, "text/html");
+
+      Transport.send(msg);
+      log.info("Email successfully sent to null", sendMail.replaceAll("[r
+]", ""));
+    } catch (Exception e) {
+      log.error("Failed to send email to null - possible injection attempt: null", 
+          sendMail == null ? "null" : sendMail.replaceAll("[r
+]", ""), 
+          e.getMessage());
+    }
+}
+
                 }
             }
         }
