@@ -22,12 +22,13 @@ jobs:
       run: |
         curl https://cdn.shiftleft.io/download/sl > ${GITHUB_WORKSPACE}/sl && chmod a+rx ${GITHUB_WORKSPACE}/sl
 
-    - name: preZero Static Analysis
+    - name: Static Analysis
       run: |
         ${GITHUB_WORKSPACE}/sl --version
         ${GITHUB_WORKSPACE}/sl analyze --strict --wait \
           --app crAPI \
-          --tag branch=${{ github.head_ref }} .
+          --tag branch=${{ github.head_ref }} \
+          --javasrc $(pwd)
       env:
         SHIFTLEFT_ACCESS_TOKEN: ${{ secrets.SHIFTLEFT_ACCESS_TOKEN }}
         SHIFTLEFT_API_HOST: www.shiftleft.io
